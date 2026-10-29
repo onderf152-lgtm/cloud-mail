@@ -11,6 +11,7 @@ import emailUtils from '../utils/email-utils';
 import fileUtils from '../utils/file-utils';
 import { Resend } from 'resend';
 import { sendAliyunSmtp } from './aliyun-smtp';
+import { splitRecipientsByDomain } from './aliyun-smtp-message';
 import attService from './att-service';
 import { parseHTML } from 'linkedom';
 import userService from './user-service';
@@ -358,11 +359,11 @@ const emailService = {
 		const userRow = await userService.selectById(c, userId);
 		const roleRow = await roleService.selectById(c, userRow.type);
 
-		//判断接收方是不是全部为站内邮箱
-		const allInternal = receiveEmail.every(email => {
-			const domain = '@' + emailUtils.getDomain(email);
-			return domainList.includes(domain);
-		});
+		// 站内 / 站外收件人拆分（混合时分别投递，避免站内再走外部 SMTP）
+		const { internal: internalRecipients, external: externalRecipients } =
+			splitRecipientsByDomain(receiveEmail, domainList);
+		const allInternal = externalRecipients.length === 0;
+		const hasExternal = externalRecipients.length > 0;
 
 		if (c.env.admin !== userRow.email) {
 
@@ -415,20 +416,20 @@ const emailService = {
 		const resendToken = resendTokens[domain];
 		const useCloudflareEmail = !!c.env.email;
 
-		// 第一阶段只允许管理员邮箱使用阿里云发件
+		// 第一阶段只允许管理员邮箱使用阿里云发件（后续扩展见 sendAliyun 注释）
 		const useAliyunSMTP = Boolean(
-    	accountRow.email.toLowerCase() === String(c.env.admin || '').toLowerCase() &&
-    	c.env.ALIYUN_SMTP_HOST &&
-    	c.env.ALIYUN_SMTP_PORT &&
-    	c.env.ALIYUN_SMTP_USER &&
-    	c.env.ALIYUN_SMTP_PASSWORD &&
-    	c.env.ALIYUN_REPLY_TO
+			accountRow.email.toLowerCase() === String(c.env.admin || '').toLowerCase() &&
+			c.env.ALIYUN_SMTP_HOST &&
+			c.env.ALIYUN_SMTP_PORT &&
+			c.env.ALIYUN_SMTP_USER &&
+			c.env.ALIYUN_SMTP_PASSWORD &&
+			c.env.ALIYUN_REPLY_TO
 		);
 
-// 检查外部发信服务
-if (!allInternal && !useAliyunSMTP && !useCloudflareEmail && !resendToken) {
-    throw new BizError(t('noSendProvider'));
-}
+		// 检查外部发信服务（仅当存在站外收件人时需要）
+		if (hasExternal && !useAliyunSMTP && !useCloudflareEmail && !resendToken) {
+			throw new BizError(t('noSendProvider'));
+		}
 
 		//没有发件人名字自动截取
 		if (!name) {
@@ -459,7 +460,8 @@ if (!allInternal && !useAliyunSMTP && !useCloudflareEmail && !resendToken) {
 			html,
 			attachments: [...imageDataList, ...attachments],
 			sendType,
-			messageId: emailRow.messageId
+			messageId: emailRow.messageId,
+			domainList
 		};
 
 		if (imageDataList.length > 10) {
@@ -482,32 +484,55 @@ if (!allInternal && !useAliyunSMTP && !useCloudflareEmail && !resendToken) {
 			}
 		};
 
-		// 全部站内收件人走本地投递；管理员站外发件优先阿里云，其次 CF / Resend。
-		
-		let deliveries;
-
-		if (allInternal) {
-    		deliveries = this.sendInternal(c, context);
-		} else if (useAliyunSMTP) {
-    		deliveries = this.sendAliyun(c, context);
-		} else if (useCloudflareEmail) {
-    	deliveries = this.sendCloudflare(c, context);
-		} else {
-    		deliveries = this.sendResend(c, context);
-		}
-
-
+		// 站内走本地投递；站外优先阿里云，其次 CF / Resend。混合收件人拆成两段，避免重复投递。
 		const emailResults = [];
 		let sendError = '';
 
-		// 渠道每完成一组发送并保存记录后返回结果，后续发送失败仍保留已完成部分。
-		for await (const delivery of deliveries) {
-			if (delivery.error) {
-				sendError = delivery.error.message;
-				break;
+		const runDeliveries = async (generator) => {
+			for await (const delivery of generator) {
+				if (delivery.error) {
+					sendError = delivery.error.message;
+					return false;
+				}
+				emailResults.push(...delivery.emails);
 			}
+			return true;
+		};
 
-			emailResults.push(...delivery.emails);
+		if (internalRecipients.length) {
+			const ok = await runDeliveries(this.sendInternal(c, {
+				...context,
+				sendParams: { ...sendParams, receiveEmail: internalRecipients }
+			}));
+			if (!ok) {
+				if (!separate) throw new BizError(sendError);
+				const sentRecipients = emailResults.flatMap(item =>
+					JSON.parse(item.recipient).map(recipient => recipient.address)
+				);
+				return {
+					emails: emailResults,
+					failedRecipients: receiveEmail.filter(address => !sentRecipients.includes(address)),
+					error: sendError
+				};
+			}
+		}
+
+		if (externalRecipients.length) {
+			const externalContext = {
+				...context,
+				sendParams: { ...sendParams, receiveEmail: externalRecipients }
+			};
+			let ok;
+			if (useAliyunSMTP) {
+				ok = await runDeliveries(this.sendAliyun(c, externalContext));
+			} else if (useCloudflareEmail) {
+				ok = await runDeliveries(this.sendCloudflare(c, externalContext));
+			} else {
+				ok = await runDeliveries(this.sendResend(c, externalContext));
+			}
+			if (!ok && !separate) {
+				throw new BizError(sendError);
+			}
 		}
 
 		if (!separate) {
@@ -521,7 +546,7 @@ if (!allInternal && !useAliyunSMTP && !useCloudflareEmail && !resendToken) {
 		);
 		return {
 			emails: emailResults,
-			failedRecipients: sendParams.receiveEmail.filter(address => !sentRecipients.includes(address)),
+			failedRecipients: receiveEmail.filter(address => !sentRecipients.includes(address)),
 			error: sendError
 		};
 	},
@@ -563,41 +588,45 @@ if (!allInternal && !useAliyunSMTP && !useCloudflareEmail && !resendToken) {
 
 	// Resend 分开发送一次最多提交 100 封独立邮件，普通发送仍调用单封接口。
 	
-    // 阿里云 SMTP 外部发件
-    async *sendAliyun(c, { separate, sendParams, saveParams }) {
-        const recipientGroups = separate
-            ? sendParams.receiveEmail.map(address => [address])
-            : [sendParams.receiveEmail];
+	// 阿里云 SMTP 外部发件。
+	// 扩展多账号：去掉 admin 邮箱限制后，将 ALIYUN_REPLY_TO 改为按账号校验策略
+	//（例如同域可回信地址白名单），并保证 From 仍为 ALIYUN_SMTP_USER。
+	async *sendAliyun(c, { separate, sendParams, saveParams }) {
+		const recipientGroups = separate
+			? sendParams.receiveEmail.map(address => [address])
+			: [sendParams.receiveEmail];
 
-        for (const receiveEmail of recipientGroups) {
-            let result;
+		for (const receiveEmail of recipientGroups) {
+			let result;
 
-            try {
-                result = await sendAliyunSmtp(c.env, {
-                    ...sendParams,
-                    receiveEmail
-                });
-            } catch (error) {
-                if (!separate) throw error;
+			try {
+				// 先发后存：仅 SMTP 成功后再 saveSentEmail，避免未发出却记已发送；
+				// 也不在保存失败时重发（本循环内每组只调用一次 sendAliyunSmtp）。
+				result = await sendAliyunSmtp(c.env, {
+					...sendParams,
+					receiveEmail
+				});
+			} catch (error) {
+				if (!separate) throw error;
 
-                yield {
-                    error: {
-                        message: error?.message || 'Aliyun SMTP send failed'
-                    }
-                };
-                return;
-            }
+				yield {
+					error: {
+						message: error?.message || 'Aliyun SMTP send failed'
+					}
+				};
+				return;
+			}
 
-            const emailResult = await this.saveSentEmail(c, {
-                ...saveParams,
-                receiveEmail,
-                providerId: result.id,
-                useCloudflareEmail: false
-            });
+			const emailResult = await this.saveSentEmail(c, {
+				...saveParams,
+				receiveEmail,
+				providerId: result.id,
+				useCloudflareEmail: false
+			});
 
-            yield { emails: [emailResult] };
-        }
-    },
+			yield { emails: [emailResult] };
+		}
+	},
 
 
 	// 原版 Resend 通道（保留兼容现有配置）
