@@ -12,6 +12,8 @@ import fileUtils from '../utils/file-utils';
 import { Resend } from 'resend';
 import { sendAliyunSmtp } from './aliyun-smtp';
 import { splitRecipientsByDomain } from './aliyun-smtp-message';
+import accountSmtpService from './account-smtp-service';
+import { hasAliyunSendCred } from '../utils/aliyun-smtp-auth';
 import attService from './att-service';
 import { parseHTML } from 'linkedom';
 import userService from './user-service';
@@ -416,19 +418,15 @@ const emailService = {
 		const resendToken = resendTokens[domain];
 		const useCloudflareEmail = !!c.env.email;
 
-		// 第一阶段只允许管理员邮箱使用阿里云发件（后续扩展见 sendAliyun 注释）
-		const useAliyunSMTP = Boolean(
-			accountRow.email.toLowerCase() === String(c.env.admin || '').toLowerCase() &&
-			c.env.ALIYUN_SMTP_HOST &&
-			c.env.ALIYUN_SMTP_PORT &&
-			c.env.ALIYUN_SMTP_USER &&
-			c.env.ALIYUN_SMTP_PASSWORD &&
-			c.env.ALIYUN_REPLY_TO
-		);
-
-		// 检查外部发信服务（仅当存在站外收件人时需要）
-		if (hasExternal && !useAliyunSMTP && !useCloudflareEmail && !resendToken) {
-			throw new BizError(t('noSendProvider'));
+		// 企业邮箱站外发信：Aliyun SMTP only（DomainAuth 域密码 或 address 每账号密码）。
+		// 禁止回退全局 no-reply / 其它账号凭据，也禁止 sendCloudflare / sendResend 自动代发。
+		// 混合收件人必须先拿到有效凭据，再开始任何投递。
+		let aliyunSmtpCred = null;
+		if (hasExternal) {
+			aliyunSmtpCred = await accountSmtpService.tryGetForSend(c, accountId, accountRow.email);
+			if (!aliyunSmtpCred) {
+				throw new BizError(t('smtpNotConfigured'));
+			}
 		}
 
 		//没有发件人名字自动截取
@@ -473,8 +471,10 @@ const emailService = {
 
 		const separate = params.manyType === 'divide';
 		// sendParams 用于渠道请求，saveParams 保留保存记录所需的账号、权限和附件数据。
+		// useCloudflareEmail / resendToken 仍传入上下文，供站内转发等既有逻辑使用，不用于站外代发。
 		const context = {
 			separate, allInternal, useCloudflareEmail, resendToken, sendParams,
+			aliyunSmtpCred,
 			saveParams: {
 				accountId, userId, name, subject, text, html,
 				sendEmail: accountRow.email,
@@ -484,7 +484,7 @@ const emailService = {
 			}
 		};
 
-		// 站内走本地投递；站外优先阿里云，其次 CF / Resend。混合收件人拆成两段，避免重复投递。
+		// 站内走本地投递；站外仅走本账号阿里云 SMTP。
 		const emailResults = [];
 		let sendError = '';
 
@@ -518,18 +518,10 @@ const emailService = {
 		}
 
 		if (externalRecipients.length) {
-			const externalContext = {
+			const ok = await runDeliveries(this.sendAliyun(c, {
 				...context,
 				sendParams: { ...sendParams, receiveEmail: externalRecipients }
-			};
-			let ok;
-			if (useAliyunSMTP) {
-				ok = await runDeliveries(this.sendAliyun(c, externalContext));
-			} else if (useCloudflareEmail) {
-				ok = await runDeliveries(this.sendCloudflare(c, externalContext));
-			} else {
-				ok = await runDeliveries(this.sendResend(c, externalContext));
-			}
+			}));
 			if (!ok && !separate) {
 				throw new BizError(sendError);
 			}
@@ -588,10 +580,14 @@ const emailService = {
 
 	// Resend 分开发送一次最多提交 100 封独立邮件，普通发送仍调用单封接口。
 	
-	// 阿里云 SMTP 外部发件。
-	// 扩展多账号：去掉 admin 邮箱限制后，将 ALIYUN_REPLY_TO 改为按账号校验策略
-	//（例如同域可回信地址白名单），并保证 From 仍为 ALIYUN_SMTP_USER。
-	async *sendAliyun(c, { separate, sendParams, saveParams }) {
+	// 阿里云 SMTP 外部发件：
+	// - DomainAuth：AUTH=域名(authUser)，MAIL FROM/From/Reply-To=account.email
+	// - address：AUTH=user(=account.email)，MAIL FROM/From/Reply-To=account.email
+	// 不回退全局 no-reply / CF / Resend。
+	async *sendAliyun(c, { separate, sendParams, saveParams, aliyunSmtpCred }) {
+		if (!hasAliyunSendCred(aliyunSmtpCred)) {
+			throw new BizError(t('smtpNotConfigured'));
+		}
 		const recipientGroups = separate
 			? sendParams.receiveEmail.map(address => [address])
 			: [sendParams.receiveEmail];
@@ -600,12 +596,11 @@ const emailService = {
 			let result;
 
 			try {
-				// 先发后存：仅 SMTP 成功后再 saveSentEmail，避免未发出却记已发送；
-				// 也不在保存失败时重发（本循环内每组只调用一次 sendAliyunSmtp）。
+				// 先发后存：仅 SMTP 成功后再 saveSentEmail；每组只调用一次，不重发。
 				result = await sendAliyunSmtp(c.env, {
 					...sendParams,
 					receiveEmail
-				});
+				}, { smtp: aliyunSmtpCred });
 			} catch (error) {
 				if (!separate) throw error;
 

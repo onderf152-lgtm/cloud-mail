@@ -119,19 +119,77 @@ export class SmtpConnection {
 	}
 }
 
-export async function sendAliyunSmtp(env, params, { connectFn, timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
-	const host = String(env.ALIYUN_SMTP_HOST || '').trim();
-	const port = Number(env.ALIYUN_SMTP_PORT || 465);
-	const username = emailAddress(env.ALIYUN_SMTP_USER);
-	const password = String(env.ALIYUN_SMTP_PASSWORD || '');
+/**
+ * Normalize SMTP send options.
+ * - address (default / legacy): { user, password } with user === accountEmail
+ * - domain (DomainAuth): { authMode:'domain', authUser: domain, password, mailFrom? }
+ * Never falls back to global ALIYUN_SMTP_USER / PASSWORD / REPLY_TO / no-reply.
+ */
+export function normalizeSmtpSendOptions(env, params, smtp) {
+	if (!smtp || !smtp.password) {
+		throw new Error('Invalid Aliyun SMTP configuration');
+	}
+	const host = String(smtp.host || env.ALIYUN_SMTP_HOST || '').trim();
+	const port = Number(smtp.port || env.ALIYUN_SMTP_PORT || 465);
+	const accountEmail = emailAddress(params.accountEmail);
+	const authMode = String(smtp.authMode || 'address').toLowerCase();
+	const password = String(smtp.password);
+
 	if (!host || !password || port !== 465 || !/^[a-zA-Z0-9.-]+$/.test(host)) {
 		throw new Error('Invalid Aliyun SMTP configuration');
 	}
 
+	if (authMode === 'domain') {
+		const authUser = String(smtp.authUser || smtp.user || '').trim().toLowerCase().replace(/^@+/, '');
+		if (!authUser || authUser.includes('@')) {
+			throw new Error('DomainAuth AUTH user must be the bare sending domain');
+		}
+		const accountDomain = accountEmail.split('@')[1].toLowerCase();
+		if (accountDomain !== authUser) {
+			throw new Error('Account email domain does not match DomainAuth AUTH domain');
+		}
+		if (smtp.mailFrom && emailAddress(smtp.mailFrom).toLowerCase() !== accountEmail.toLowerCase()) {
+			throw new Error('DomainAuth mailFrom must match account email');
+		}
+		return {
+			authMode: 'domain',
+			host,
+			port,
+			authUser,
+			password,
+			accountEmail,
+			sendDomain: authUser,
+		};
+	}
+
+	const username = emailAddress(smtp.user || smtp.authUser);
+	if (username.toLowerCase() !== accountEmail.toLowerCase()) {
+		throw new Error('SMTP user must match account email');
+	}
+	return {
+		authMode: 'address',
+		host,
+		port,
+		authUser: username,
+		password,
+		accountEmail,
+		sendDomain: null,
+	};
+}
+
+/**
+ * Aliyun SMTP send (address-level or DomainAuth).
+ * MAIL FROM / MIME From / Reply-To always equal params.accountEmail.
+ */
+export async function sendAliyunSmtp(env, params, { connectFn, timeoutMs = DEFAULT_TIMEOUT_MS, smtp } = {}) {
+	const opts = normalizeSmtpSendOptions(env, params, smtp);
+
 	const replyTo = resolveAliyunReplyTo({
-		accountEmail: params.accountEmail,
+		accountEmail: opts.accountEmail,
 		domainList: params.domainList,
-		env
+		authMode: opts.authMode,
+		sendDomain: opts.sendDomain,
+		smtpUser: opts.authMode === 'address' ? opts.authUser : undefined,
 	});
 
 	const to = (params.receiveEmail || []).map(emailAddress);
@@ -143,7 +201,7 @@ export async function sendAliyunSmtp(env, params, { connectFn, timeoutMs = DEFAU
 	}
 
 	const message = makeAliyunEmail({
-		from: username,
+		from: opts.accountEmail,
 		replyTo,
 		to,
 		name: params.name,
@@ -156,24 +214,24 @@ export async function sendAliyunSmtp(env, params, { connectFn, timeoutMs = DEFAU
 	});
 
 	const connectImpl = connectFn || (await import('cloudflare:sockets')).connect;
-	const socket = connectImpl({ hostname: host, port }, { secureTransport: 'on' });
-	const smtp = new SmtpConnection(socket, { timeoutMs });
+	const socket = connectImpl({ hostname: opts.host, port: opts.port }, { secureTransport: 'on' });
+	const conn = new SmtpConnection(socket, { timeoutMs });
 	try {
 		await withTimeout(socket.opened, timeoutMs, 'SMTP connect');
-		await smtp.reply([220]);
-		await smtp.command('EHLO cloud-mail', [250]);
-		await smtp.command('AUTH LOGIN', [334]);
-		await smtp.command(b64Utf8(username), [334]);
-		await smtp.command(b64Utf8(password), [235]);
-		await smtp.command(`MAIL FROM:<${username}>`, [250]);
+		await conn.reply([220]);
+		await conn.command('EHLO cloud-mail', [250]);
+		await conn.command('AUTH LOGIN', [334]);
+		await conn.command(b64Utf8(opts.authUser), [334]);
+		await conn.command(b64Utf8(opts.password), [235]);
+		await conn.command(`MAIL FROM:<${opts.accountEmail}>`, [250]);
 		for (const recipient of to) {
-			await smtp.command(`RCPT TO:<${recipient}>`, [250, 251]);
+			await conn.command(`RCPT TO:<${recipient}>`, [250, 251]);
 		}
-		await smtp.command('DATA', [354]);
-		await smtp.data(message.raw);
-		await smtp.quit();
+		await conn.command('DATA', [354]);
+		await conn.data(message.raw);
+		await conn.quit();
 		return { id: message.id };
 	} finally {
-		await smtp.close();
+		await conn.close();
 	}
 }

@@ -7,15 +7,10 @@ function linesToChunks(lines) {
 	return new TextEncoder().encode(text);
 }
 
-/**
- * Minimal mock TCP socket that speaks a scripted SMTP server.
- * `script` is an array of server response blocks pushed after each client write (plus greeting on open).
- */
 function createMockSocket(script) {
 	const queue = [...script];
 	let pending = linesToChunks(queue.shift() || ['220 mock ESMTP']);
 	const reads = [];
-	let writeCount = 0;
 	const written = [];
 
 	const readable = new ReadableStream({
@@ -37,7 +32,6 @@ function createMockSocket(script) {
 	const writable = new WritableStream({
 		write(chunk) {
 			written.push(new TextDecoder().decode(chunk));
-			writeCount++;
 			const next = queue.shift();
 			if (next) {
 				pending = linesToChunks(Array.isArray(next) ? next : [next]);
@@ -57,17 +51,21 @@ function createMockSocket(script) {
 		writable,
 		opened: Promise.resolve(),
 		close: vi.fn(async () => {}),
-		_written: written,
-		_writeCount: () => writeCount
+		_written: written
 	};
 }
 
 const baseEnv = {
-	ALIYUN_SMTP_HOST: 'smtpdm.aliyun.com',
-	ALIYUN_SMTP_PORT: '465',
-	ALIYUN_SMTP_USER: 'noreply@dm.example.com',
-	ALIYUN_SMTP_PASSWORD: 'smtp-secret',
-	ALIYUN_REPLY_TO: 'admin@corp.example.com'
+	ALIYUN_SMTP_HOST: 'smtpdm.aliyuncs.com',
+	ALIYUN_SMTP_PORT: '465'
+	// no global USER/PASSWORD/REPLY_TO — multi-account must not use them
+};
+
+const accountSmtp = {
+	host: 'smtpdm.aliyuncs.com',
+	port: 465,
+	user: 'admin@corp.example.com',
+	password: 'per-account-secret'
 };
 
 const baseParams = {
@@ -96,38 +94,54 @@ const successScript = [
 	['221 Bye']
 ];
 
-describe('sendAliyunSmtp', () => {
-	it('sends successfully with mocked socket and returns message id', async () => {
+describe('sendAliyunSmtp multi-account', () => {
+	it('sends with per-account credentials; From/AUTH equal account email', async () => {
 		const socket = createMockSocket(successScript);
 		const result = await sendAliyunSmtp(baseEnv, baseParams, {
 			connectFn: () => socket,
-			timeoutMs: 5000
+			timeoutMs: 5000,
+			smtp: accountSmtp
 		});
-		expect(result.id).toMatch(/^<.+@dm\.example\.com>$/);
+		expect(result.id).toMatch(/^<.+@corp\.example\.com>$/);
 		const transcript = socket._written.join('');
-		expect(transcript).toContain('AUTH LOGIN');
-		expect(transcript).toContain(b64Utf8(baseEnv.ALIYUN_SMTP_USER));
-		expect(transcript).toContain(`MAIL FROM:<${baseEnv.ALIYUN_SMTP_USER}>`);
-		expect(transcript).toContain('RCPT TO:<friend@gmail.com>');
-		expect(transcript).toContain('DATA');
-		expect(transcript).not.toContain(baseEnv.ALIYUN_SMTP_PASSWORD);
+		expect(transcript).toContain(b64Utf8(accountSmtp.user));
+		expect(transcript).toContain(`MAIL FROM:<${accountSmtp.user}>`);
+		expect(transcript).toContain('From:');
+		expect(transcript).toContain(`<${accountSmtp.user}>`);
+		expect(transcript).toContain(`Reply-To: <${accountSmtp.user}>`);
+		expect(transcript).not.toContain(accountSmtp.password);
 		expect(transcript).toContain('QUIT');
 	});
 
-	it('rejects invalid SMTP configuration', async () => {
-		await expect(sendAliyunSmtp({
-			...baseEnv,
-			ALIYUN_SMTP_PORT: '587'
-		}, baseParams, { connectFn: () => createMockSocket(successScript) }))
-			.rejects.toThrow('Invalid Aliyun SMTP configuration');
+	it('rejects when smtp credentials are missing (no global fallback)', async () => {
+		await expect(sendAliyunSmtp(baseEnv, baseParams, {
+			connectFn: () => createMockSocket(successScript)
+		})).rejects.toThrow('Invalid Aliyun SMTP configuration');
 	});
 
-	it('fails closed when Reply-To policy does not match', async () => {
-		await expect(sendAliyunSmtp(baseEnv, {
+	it('rejects when SMTP user does not match account email (no impersonation)', async () => {
+		await expect(sendAliyunSmtp(baseEnv, baseParams, {
+			connectFn: () => createMockSocket(successScript),
+			smtp: { ...accountSmtp, user: 'noreply@notify.corp.example.com' }
+		})).rejects.toThrow('SMTP user must match account email');
+	});
+
+	it('supports a second mailbox with its own identity', async () => {
+		const socket = createMockSocket(successScript);
+		const user = '1@corp.example.com';
+		await sendAliyunSmtp(baseEnv, {
 			...baseParams,
-			accountEmail: 'other@corp.example.com'
-		}, { connectFn: () => createMockSocket(successScript) }))
-			.rejects.toThrow('Reply-To must match the verified Aliyun reply address');
+			accountEmail: user
+		}, {
+			connectFn: () => socket,
+			timeoutMs: 5000,
+			smtp: { ...accountSmtp, user, password: 'mailbox-1-pass' }
+		});
+		const transcript = socket._written.join('');
+		expect(transcript).toContain(`MAIL FROM:<${user}>`);
+		expect(transcript).toContain(`Reply-To: <${user}>`);
+		expect(transcript).not.toContain('admin@corp.example.com');
+		expect(transcript).not.toContain('mailbox-1-pass');
 	});
 
 	it('surfaces SMTP auth failure without leaking password', async () => {
@@ -141,9 +155,10 @@ describe('sendAliyunSmtp', () => {
 		const socket = createMockSocket(script);
 		await expect(sendAliyunSmtp(baseEnv, baseParams, {
 			connectFn: () => socket,
-			timeoutMs: 5000
+			timeoutMs: 5000,
+			smtp: accountSmtp
 		})).rejects.toThrow('SMTP command rejected (535)');
-		expect(socket._written.join('')).not.toContain(baseEnv.ALIYUN_SMTP_PASSWORD);
+		expect(socket._written.join('')).not.toContain(accountSmtp.password);
 	});
 
 	it('times out when server never responds', async () => {
@@ -159,23 +174,98 @@ describe('sendAliyunSmtp', () => {
 		};
 		await expect(sendAliyunSmtp(baseEnv, baseParams, {
 			connectFn: () => socket,
-			timeoutMs: 50
+			timeoutMs: 50,
+			smtp: accountSmtp
 		})).rejects.toThrow(/timed out/);
 	});
 
-	it('sends with attachment payload in DATA', async () => {
+	it('includes attachments and reply headers', async () => {
 		const socket = createMockSocket(successScript);
 		await sendAliyunSmtp(baseEnv, {
 			...baseParams,
+			sendType: 'reply',
+			messageId: '<orig@mail.example.com>',
 			attachments: [{
 				filename: 'a.txt',
 				contentType: 'text/plain',
 				content: btoa('file')
+			}, {
+				filename: 'embed.png',
+				contentType: 'image/png',
+				contentId: 'cid1',
+				content: btoa('png')
 			}]
-		}, { connectFn: () => socket, timeoutMs: 5000 });
+		}, { connectFn: () => socket, timeoutMs: 5000, smtp: accountSmtp });
 		const transcript = socket._written.join('');
 		expect(transcript).toContain('multipart/mixed');
-		expect(transcript).toContain('filename="a.txt"');
+		expect(transcript).toContain('Content-ID: <cid1>');
+		expect(transcript).toContain('In-Reply-To: <orig@mail.example.com>');
+	});
+});
+
+describe('sendAliyunSmtp DomainAuth', () => {
+	const domainSmtp = {
+		authMode: 'domain',
+		host: 'smtpdm-ap-southeast-1.aliyuncs.com',
+		port: 465,
+		authUser: 'corp.example.com',
+		password: 'DomainPass12ab',
+	};
+
+	it('AUTH uses domain; MAIL FROM / From / Reply-To use account email', async () => {
+		const socket = createMockSocket(successScript);
+		await sendAliyunSmtp(baseEnv, baseParams, {
+			connectFn: () => socket,
+			timeoutMs: 5000,
+			smtp: domainSmtp,
+		});
+		const transcript = socket._written.join('');
+		expect(transcript).toContain(b64Utf8('corp.example.com'));
+		expect(transcript).toContain('MAIL FROM:<admin@corp.example.com>');
+		expect(transcript).toContain('Reply-To: <admin@corp.example.com>');
+		expect(transcript).toContain('<admin@corp.example.com>');
+		expect(transcript).not.toContain(domainSmtp.password);
+		expect(transcript).not.toContain(b64Utf8('admin@corp.example.com'));
+	});
+
+	it('keeps independent From for mailbox 1@ and 2@ with shared domain password', async () => {
+		for (const user of ['1@corp.example.com', '2@corp.example.com']) {
+			const socket = createMockSocket(successScript);
+			await sendAliyunSmtp(baseEnv, {
+				...baseParams,
+				accountEmail: user,
+			}, {
+				connectFn: () => socket,
+				timeoutMs: 5000,
+				smtp: domainSmtp,
+			});
+			const transcript = socket._written.join('');
+			expect(transcript).toContain(b64Utf8('corp.example.com'));
+			expect(transcript).toContain(`MAIL FROM:<${user}>`);
+			expect(transcript).toContain(`Reply-To: <${user}>`);
+			expect(transcript).not.toContain('admin@corp.example.com');
+		}
+	});
+
+	it('rejects DomainAuth when AUTH domain mismatches account email', async () => {
+		await expect(sendAliyunSmtp(baseEnv, baseParams, {
+			connectFn: () => createMockSocket(successScript),
+			smtp: { ...domainSmtp, authUser: 'other.com' },
+		})).rejects.toThrow(/does not match DomainAuth AUTH domain/);
+	});
+
+	it('rejects cross-mailbox mailFrom spoofing in DomainAuth', async () => {
+		await expect(sendAliyunSmtp(baseEnv, baseParams, {
+			connectFn: () => createMockSocket(successScript),
+			smtp: { ...domainSmtp, mailFrom: '2@corp.example.com' },
+		})).rejects.toThrow(/mailFrom must match account email/);
+	});
+
+	it('does not fall back to address-style user when domain mode lacks authUser', async () => {
+		await expect(sendAliyunSmtp(baseEnv, baseParams, {
+			connectFn: () => createMockSocket(successScript),
+			smtp: { authMode: 'domain', host: domainSmtp.host, port: 465, password: 'x', user: 'admin@corp.example.com' },
+		})).rejects.toThrow(/bare sending domain/);
 	});
 });
 
