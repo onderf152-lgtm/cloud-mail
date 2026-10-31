@@ -45,7 +45,7 @@ app.put('/user/restore', async (c) => {
 });
 
 app.get('/user/allAccount', async (c) => {
-	const data = await accountService.allAccount(c, c.req.query());
+	const data = await accountService.allAccountWithSmtp(c, c.req.query());
 	return c.json(result.ok(data));
 });
 

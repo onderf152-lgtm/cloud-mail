@@ -12,6 +12,7 @@ import turnstileService from './turnstile-service';
 import roleService from './role-service';
 import { t } from '../i18n/i18n';
 import verifyRecordService from './verify-record-service';
+import accountSmtpService from './account-smtp-service';
 
 const accountService = {
 
@@ -191,6 +192,9 @@ const accountService = {
 	},
 
 	async physicsDeleteByUserIds(c, userIds) {
+		const rows = await orm(c).select({ accountId: account.accountId }).from(account)
+			.where(inArray(account.userId, userIds)).all();
+		await accountSmtpService.removeByAccountIds(c, rows.map(r => r.accountId));
 		await emailService.physicsDeleteUserIds(c, userIds);
 		await orm(c).delete(account).where(inArray(account.userId,userIds)).run();
 	},
@@ -256,8 +260,43 @@ const accountService = {
 
 	async physicsDelete(c, params) {
 		const { accountId } = params
+		await accountSmtpService.removeByAccountId(c, accountId)
 		await emailService.physicsDeleteByAccountId(c, accountId)
 		await orm(c).delete(account).where(eq(account.accountId, accountId)).run();
+	},
+
+	async allAccountWithSmtp(c, params) {
+		// Include primary mailbox so admin can configure SMTP for every address.
+		let { userId, num, size } = params;
+		userId = Number(userId);
+		num = Number(num);
+		size = Number(size);
+		if (size > 30) size = 30;
+		const offset = (num - 1) * size;
+
+		const list = await orm(c).select().from(account)
+			.where(eq(account.userId, userId))
+			.orderBy(asc(account.sort), asc(account.accountId))
+			.limit(size).offset(offset);
+		const { total } = await orm(c).select({ total: count() }).from(account)
+			.where(eq(account.userId, userId)).get();
+
+		const statusMap = await accountSmtpService.listStatusByAccountIds(
+			c,
+			list.map(item => item.accountId)
+		);
+		return {
+			list: list.map(item => ({
+				...item,
+				smtpConfigured: Boolean(statusMap[item.accountId]?.configured),
+				smtpStatus: statusMap[item.accountId]?.status || 0,
+				smtpUser: statusMap[item.accountId]?.smtpUser || '',
+				smtpUpdatedAt: statusMap[item.accountId]?.updatedAt || null,
+				domainAuth: Boolean(statusMap[item.accountId]?.domainAuth),
+				smtpAuthMode: statusMap[item.accountId]?.authMode || 'address',
+			})),
+			total
+		};
 	},
 
 	async setAllReceive(c, params, userId) {

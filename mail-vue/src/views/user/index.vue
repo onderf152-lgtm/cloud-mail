@@ -212,12 +212,21 @@
             <el-tag type="info" disable-transitions v-if="props.row.isDel === 1">{{$t('deleted')}}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column :label="t('action')" :width="locale === 'en' ? 75 : 65" >
+        <el-table-column :label="t('smtpSendConfig')" :min-width="locale === 'en' ? 120 : 100">
+          <template #default="props">
+            <el-tag type="success" disable-transitions v-if="props.row.domainAuth && props.row.smtpConfigured">{{ $t('smtpDomainAuthTag') }}</el-tag>
+            <el-tag type="success" disable-transitions v-else-if="props.row.smtpConfigured && props.row.smtpStatus === 1">{{ $t('smtpConfigured') }}</el-tag>
+            <el-tag type="warning" disable-transitions v-else-if="props.row.smtpConfigured && props.row.smtpStatus === 2">{{ $t('smtpDisabledTag') }}</el-tag>
+            <el-tag type="info" disable-transitions v-else>{{ $t('smtpNotSet') }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column :label="t('action')" :width="locale === 'en' ? 90 : 80" >
           <template #default="props">
             <el-dropdown trigger="click">
               <el-button type="primary" size="small">{{t('action')}}</el-button>
               <template #dropdown>
                 <el-dropdown-menu>
+                  <el-dropdown-item @click="openSmtpDialog(props.row)" :disabled="props.row.isDel === 1">{{ $t('smtpSendConfig') }}</el-dropdown-item>
                   <el-dropdown-item @click="deleteAccount(props.row)">{{ $t('delete') }}</el-dropdown-item>
                 </el-dropdown-menu>
               </template>
@@ -236,6 +245,39 @@
             @current-change="accountCurChange"
         />
       </div>
+    </el-dialog>
+    <el-dialog v-model="smtpShow" :title="t('smtpSendConfig')" width="420px" @closed="resetSmtpForm">
+      <div class="smtp-form">
+        <div class="smtp-row"><span class="smtp-label">{{ $t('emailAccount') }}</span>{{ smtpForm.email }}</div>
+        <div class="smtp-row"><span class="smtp-label">{{ $t('smtpStatusLabel') }}</span>
+          <el-tag type="success" v-if="smtpForm.domainAuth && smtpForm.configured">{{ $t('smtpDomainAuthTag') }}</el-tag>
+          <el-tag type="success" v-else-if="smtpForm.configured && smtpForm.status === 1">{{ $t('smtpConfigured') }}</el-tag>
+          <el-tag type="warning" v-else-if="smtpForm.configured && smtpForm.status === 2">{{ $t('smtpDisabledTag') }}</el-tag>
+          <el-tag type="info" v-else>{{ $t('smtpNotSet') }}</el-tag>
+        </div>
+        <div class="smtp-hint" v-if="smtpForm.domainAuth">{{ $t('smtpDomainAuthHint') }}</div>
+        <template v-else>
+          <div class="smtp-hint">{{ $t('smtpPasswordHint') }}</div>
+          <el-input
+              v-model="smtpForm.password"
+              type="password"
+              show-password
+              autocomplete="new-password"
+              :placeholder="$t('smtpPasswordPlaceholder')"
+          />
+        </template>
+      </div>
+      <template #footer>
+        <div class="smtp-footer">
+          <el-button @click="smtpShow = false">{{ $t('cancel') }}</el-button>
+          <template v-if="!smtpForm.domainAuth">
+            <el-button v-if="smtpForm.configured && smtpForm.status === 1" @click="disableSmtp" :loading="smtpSaving">{{ $t('smtpDisable') }}</el-button>
+            <el-button v-if="smtpForm.configured && smtpForm.status === 2" @click="enableSmtp" :loading="smtpSaving">{{ $t('smtpEnable') }}</el-button>
+            <el-button v-if="smtpForm.configured" type="danger" plain @click="revokeSmtp" :loading="smtpSaving">{{ $t('smtpRevoke') }}</el-button>
+            <el-button type="primary" @click="saveSmtp" :loading="smtpSaving">{{ $t('save') }}</el-button>
+          </template>
+        </div>
+      </template>
     </el-dialog>
     <el-dialog class="account-dialog" v-model="detailsShow" :title="t('userDetails')"  >
       <div class="details">
@@ -388,7 +430,11 @@ import {
   userRestSendCount,
   userRestore,
   userDeleteAccount,
-  userAllAccount
+  userAllAccount,
+  accountSmtpGet,
+  accountSmtpSave,
+  accountSmtpSetStatus,
+  accountSmtpDelete
 } from '@/request/user.js'
 import {roleSelectUse} from "@/request/role.js";
 import {Icon} from "@iconify/vue";
@@ -484,6 +530,16 @@ const userForm = reactive({
 
 const showAdd = ref(false)
 const accountShow = ref(false)
+const smtpShow = ref(false)
+const smtpSaving = ref(false)
+const smtpForm = reactive({
+  accountId: 0,
+  email: '',
+  password: '',
+  configured: false,
+  status: 0,
+  domainAuth: false
+})
 const addLoading = ref(false);
 const setTypeShow = ref(false)
 const setPwdShow = ref(false)
@@ -591,6 +647,96 @@ function deleteAccount(account) {
       })
     })
   });
+}
+
+function resetSmtpForm() {
+  smtpForm.accountId = 0
+  smtpForm.email = ''
+  smtpForm.password = ''
+  smtpForm.configured = false
+  smtpForm.status = 0
+  smtpForm.domainAuth = false
+}
+
+function openSmtpDialog(account) {
+  resetSmtpForm()
+  smtpForm.accountId = account.accountId
+  smtpForm.email = account.email
+  smtpForm.domainAuth = Boolean(account.domainAuth)
+  smtpShow.value = true
+  accountSmtpGet(account.accountId).then((data) => {
+    smtpForm.configured = Boolean(data?.configured)
+    smtpForm.status = data?.status || 0
+    smtpForm.email = data?.email || account.email
+    smtpForm.domainAuth = Boolean(data?.domainAuth)
+  }).catch(() => {
+    smtpForm.configured = Boolean(account.smtpConfigured)
+    smtpForm.status = account.smtpStatus || 0
+    smtpForm.domainAuth = Boolean(account.domainAuth)
+  })
+}
+
+function saveSmtp() {
+  if (!smtpForm.password) {
+    ElMessage({ message: t('smtpPasswordRequired'), type: 'warning', plain: true })
+    return
+  }
+  smtpSaving.value = true
+  accountSmtpSave({
+    accountId: smtpForm.accountId,
+    password: smtpForm.password
+  }).then((data) => {
+    smtpForm.password = ''
+    smtpForm.configured = Boolean(data?.configured)
+    smtpForm.status = data?.status || 1
+    getAccountList()
+    ElMessage({ message: t('saveSuccessMsg'), type: 'success', plain: true })
+  }).finally(() => {
+    smtpSaving.value = false
+  })
+}
+
+function disableSmtp() {
+  smtpSaving.value = true
+  accountSmtpSetStatus(smtpForm.accountId, 2).then((data) => {
+    smtpForm.status = data?.status || 2
+    smtpForm.configured = true
+    getAccountList()
+    ElMessage({ message: t('saveSuccessMsg'), type: 'success', plain: true })
+  }).finally(() => {
+    smtpSaving.value = false
+  })
+}
+
+function enableSmtp() {
+  smtpSaving.value = true
+  accountSmtpSetStatus(smtpForm.accountId, 1).then((data) => {
+    smtpForm.status = data?.status || 1
+    smtpForm.configured = true
+    getAccountList()
+    ElMessage({ message: t('saveSuccessMsg'), type: 'success', plain: true })
+  }).finally(() => {
+    smtpSaving.value = false
+  })
+}
+
+function revokeSmtp() {
+  ElMessageBox.confirm(t('smtpRevokeConfirm', { msg: smtpForm.email }), {
+    confirmButtonText: t('confirm'),
+    cancelButtonText: t('cancel'),
+    type: 'warning'
+  }).then(() => {
+    smtpSaving.value = true
+    accountSmtpDelete(smtpForm.accountId).then(() => {
+      smtpForm.configured = false
+      smtpForm.status = 0
+      smtpForm.password = ''
+      getAccountList()
+      ElMessage({ message: t('delSuccessMsg'), type: 'success', plain: true })
+    }).finally(() => {
+      smtpSaving.value = false
+    })
+  })
 }
 function accountCurChange(e) {
   accountParams.num = e
@@ -1102,12 +1248,44 @@ function adjustWidth() {
 }
 
 :deep(.account-dialog) {
-  width: 500px !important;
-  @media (max-width: 540px) {
+  width: 620px !important;
+  @media (max-width: 660px) {
     width: calc(100% - 40px) !important;
     margin-right: 20px !important;
     margin-left: 20px !important;
   }
+}
+
+.smtp-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.smtp-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  word-break: break-all;
+}
+
+.smtp-label {
+  color: var(--el-text-color-secondary);
+  min-width: 72px;
+  flex-shrink: 0;
+}
+
+.smtp-hint {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  line-height: 1.5;
+}
+
+.smtp-footer {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 .header-actions {

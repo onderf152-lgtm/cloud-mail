@@ -33,8 +33,29 @@ const dbInit = {
 		await this.v3_2DB(c);
 		await this.v3_3DB(c);
 		await this.v3_4DB(c);
+		await this.v3_5DB(c);
 		await settingService.refresh(c);
 		return c.text('success');
+	},
+
+	async v3_5DB(c) {
+		try {
+			await c.env.db.prepare(`
+				CREATE TABLE IF NOT EXISTS account_smtp (
+					account_id INTEGER PRIMARY KEY,
+					smtp_host TEXT NOT NULL DEFAULT '',
+					smtp_port INTEGER NOT NULL DEFAULT 465,
+					smtp_user TEXT NOT NULL,
+					pass_cipher TEXT NOT NULL,
+					pass_iv TEXT NOT NULL,
+					key_ver INTEGER NOT NULL DEFAULT 1,
+					status INTEGER NOT NULL DEFAULT 1,
+					updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+				)
+			`).run();
+		} catch (e) {
+			console.warn(`跳过 account_smtp 表：${e.message}`);
+		}
 	},
 
 	async v3_4DB(c) {

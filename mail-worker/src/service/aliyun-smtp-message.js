@@ -120,25 +120,46 @@ function normalizeContentId(contentId) {
 }
 
 /**
- * Reply-To must be the current Cloud Mail account, on an allowed domain,
- * and match the Aliyun-verified reply address (ALIYUN_REPLY_TO).
+ * Reply-To must equal the current Cloud Mail account.
+ * No shared ALIYUN_REPLY_TO / no-reply impersonation.
+ *
+ * address mode: optional smtpUser must equal accountEmail (AUTH = mailbox).
+ * domain mode: AUTH is the bare domain — do not compare smtpUser to Reply-To;
+ *   optional sendDomain must equal the account email domain.
  */
-export function resolveAliyunReplyTo({ accountEmail, domainList, env }) {
+export function resolveAliyunReplyTo({
+	accountEmail,
+	domainList,
+	smtpUser,
+	authMode = 'address',
+	sendDomain,
+}) {
 	const replyTo = emailAddress(accountEmail);
-	const verified = emailAddress(env?.ALIYUN_REPLY_TO);
-
 	const domains = Array.isArray(domainList) ? domainList : [];
-	const replyDomain = '@' + replyTo.split('@')[1].toLowerCase();
+	const replyDomainBare = replyTo.split('@')[1].toLowerCase();
+	const replyDomain = '@' + replyDomainBare;
 	const allowed = domains.some(item => String(item).toLowerCase() === replyDomain);
 	if (!allowed) {
 		throw new Error('Reply-To domain is not an allowed mailbox domain');
 	}
 
-	// DirectMail: SMTP Reply-To should be the verified reply address.
-	if (replyTo.toLowerCase() !== verified.toLowerCase()) {
-		throw new Error('Reply-To must match the verified Aliyun reply address');
+	const mode = String(authMode || 'address').toLowerCase();
+	if (mode === 'domain') {
+		if (sendDomain) {
+			const expected = String(sendDomain).trim().toLowerCase().replace(/^@+/, '');
+			if (replyDomainBare !== expected) {
+				throw new Error('Reply-To domain does not match DomainAuth send domain');
+			}
+		}
+		return replyTo;
 	}
 
+	if (smtpUser) {
+		const user = emailAddress(smtpUser);
+		if (user.toLowerCase() !== replyTo.toLowerCase()) {
+			throw new Error('Reply-To must match SMTP user and account email');
+		}
+	}
 	return replyTo;
 }
 

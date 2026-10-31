@@ -41,3 +41,19 @@ export function userAllAccount(userId, num, size) {
 export function userDeleteAccount(accountId) {
     return http.delete('/user/deleteAccount', {params:{accountId}})
 }
+
+export function accountSmtpGet(accountId) {
+    return http.get('/account/smtp', {params: {accountId}})
+}
+
+export function accountSmtpSave(payload) {
+    return http.put('/account/smtp', payload)
+}
+
+export function accountSmtpSetStatus(accountId, status) {
+    return http.put('/account/smtp/status', {accountId, status})
+}
+
+export function accountSmtpDelete(accountId) {
+    return http.delete('/account/smtp', {params: {accountId}})
+}
